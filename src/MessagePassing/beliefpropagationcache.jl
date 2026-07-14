@@ -60,15 +60,17 @@ function set_default_kwargs(alg::Algorithm"contract", bp_cache::AbstractBeliefPr
 end
 default_verbose(::Algorithm"bp") = false
 default_tolerance(::Algorithm"bp") = nothing
+default_msgdiffs(::Algorithm"bp") = nothing
 function set_default_kwargs(alg::Algorithm"bp", bp_cache::BeliefPropagationCache)
     verbose = get(alg.kwargs, :verbose, default_verbose(alg))
     maxiter = get(alg.kwargs, :maxiter, default_bp_maxiter(bp_cache))
     _edge_sequence = get(alg.kwargs, :edge_sequence, edge_sequence(bp_cache))
     tolerance = get(alg.kwargs, :tolerance, default_tolerance(alg))
+    msgdiffs = get(alg.kwargs, :msgdiffs, default_msgdiffs(alg))
     message_update_alg = set_default_kwargs(
         get(alg.kwargs, :message_update_alg, Algorithm(default_message_update_alg(bp_cache))), bp_cache
     )
-    return Algorithm("bp"; verbose, maxiter, edge_sequence = _edge_sequence, tolerance, message_update_alg)
+    return Algorithm("bp"; verbose, maxiter, edge_sequence = _edge_sequence, tolerance, message_update_alg, msgdiffs)
 end
 
 function update_message!(

@@ -235,6 +235,9 @@ function update(alg::Algorithm"bp", bpc::AbstractBeliefPropagationCache)
         update_iteration!(alg, bpc, alg.kwargs.edge_sequence; (update_diff!) = diff)
         if compute_error
             avg_diff = diff.x / length(alg.kwargs.edge_sequence)
+            if !isnothing(alg.kwargs.msgdiffs)
+                push!(alg.kwargs.msgdiffs, avg_diff)
+            end
             if avg_diff <= alg.kwargs.tolerance
                 converged = true
                 niter = i
