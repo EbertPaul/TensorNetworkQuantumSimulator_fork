@@ -180,8 +180,13 @@ function updated_message(
     updated_message = contract(contract_list; sequence)
 
     if alg.kwargs.normalize
-        message_norm = sum(updated_message)
+        message_norm = tr(updated_message)
+        if abs(message_norm) < 1e-8
+            @warn "Message norm is very small: $message_norm."
+        end
+
         if !iszero(message_norm)
+            #updated_message = ITensors.ITensor(M_herm, inds...) / message_norm
             updated_message = updated_message / message_norm
         end
     end
@@ -206,12 +211,20 @@ function update_iteration!(
         bpc::AbstractBeliefPropagationCache,
         edges::Vector;
         (update_diff!) = nothing,
+        (herm_error!) = nothing,
+        (cond_num!) = nothing,
     )
     for e in edges
         prev_message = !isnothing(update_diff!) ? message(bpc, e) : nothing
         update_message!(alg.kwargs.message_update_alg, bpc, e)
         if !isnothing(update_diff!)
             update_diff![] += message_diff(message(bpc, e), prev_message)
+        end
+        if !isnothing(herm_error!)
+            herm_error![] += hermiticity_error(message(bpc, e))
+        end
+        if !isnothing(cond_num!)
+            cond_num![] += condition_number(message(bpc, e))
         end
     end
     return bpc
@@ -230,13 +243,22 @@ function update(alg::Algorithm"bp", bpc::AbstractBeliefPropagationCache)
     converged = false
     avg_diff = nothing
     niter = alg.kwargs.maxiter
+    n_messages = length(edge_sequence(bpc))
     for i in 1:alg.kwargs.maxiter
         diff = compute_error ? Ref(0.0) : nothing
-        update_iteration!(alg, bpc, alg.kwargs.edge_sequence; (update_diff!) = diff)
+        herm = compute_error ? Ref(0.0) : nothing
+        cond = compute_error ? Ref(0.0) : nothing
+        update_iteration!(alg, bpc, alg.kwargs.edge_sequence; (update_diff!) = diff, (herm_error!) = herm, (cond_num!) = cond)
         if compute_error
             avg_diff = diff.x / length(alg.kwargs.edge_sequence)
             if !isnothing(alg.kwargs.msgdiffs)
                 push!(alg.kwargs.msgdiffs, avg_diff)
+            end
+            if !isnothing(alg.kwargs.herm_error)
+                push!(alg.kwargs.herm_error, herm.x/n_messages) # Average hermiticity error per message
+            end
+            if !isnothing(alg.kwargs.cond_num)
+                push!(alg.kwargs.cond_num, cond.x/n_messages) # Average condition number per message
             end
             if avg_diff <= alg.kwargs.tolerance
                 converged = true

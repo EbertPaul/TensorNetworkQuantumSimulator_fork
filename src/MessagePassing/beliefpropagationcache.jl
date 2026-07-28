@@ -16,8 +16,23 @@ end
 
 function message_diff(message_a::ITensor, message_b::ITensor)
     n_a, n_b = norm(message_a), norm(message_b)
+    if n_a < 1e-8 || n_b < 1e-8
+        println("Warning: Messages have norms $n_a and $n_b.")
+    end
     f = abs2(dot(message_a, message_b) / (n_a * n_b))
     return 1 - f
+end
+
+function hermiticity_error(message::ITensor)
+    inds = collect(ITensors.inds(message))
+    M =  Array(message, inds...)
+    return norm(M - M') / norm(M) / 2
+end
+
+function condition_number(message::ITensor)
+    inds = collect(ITensors.inds(message))
+    M =  Array(message, inds...)
+    return cond(M)
 end
 
 messages(bp_cache::BeliefPropagationCache) = bp_cache.messages
@@ -61,16 +76,20 @@ end
 default_verbose(::Algorithm"bp") = false
 default_tolerance(::Algorithm"bp") = nothing
 default_msgdiffs(::Algorithm"bp") = nothing
+default_herm_error(::Algorithm"bp") = nothing
+default_cond_num(::Algorithm"bp") = nothing
 function set_default_kwargs(alg::Algorithm"bp", bp_cache::BeliefPropagationCache)
     verbose = get(alg.kwargs, :verbose, default_verbose(alg))
     maxiter = get(alg.kwargs, :maxiter, default_bp_maxiter(bp_cache))
     _edge_sequence = get(alg.kwargs, :edge_sequence, edge_sequence(bp_cache))
     tolerance = get(alg.kwargs, :tolerance, default_tolerance(alg))
     msgdiffs = get(alg.kwargs, :msgdiffs, default_msgdiffs(alg))
+    herm_error = get(alg.kwargs, :herm_error, default_herm_error(alg))
+    cond_num = get(alg.kwargs, :cond_num, default_cond_num(alg))
     message_update_alg = set_default_kwargs(
         get(alg.kwargs, :message_update_alg, Algorithm(default_message_update_alg(bp_cache))), bp_cache
     )
-    return Algorithm("bp"; verbose, maxiter, edge_sequence = _edge_sequence, tolerance, message_update_alg, msgdiffs)
+    return Algorithm("bp"; verbose, maxiter, edge_sequence = _edge_sequence, tolerance, message_update_alg, msgdiffs, herm_error, cond_num)
 end
 
 function update_message!(
