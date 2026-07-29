@@ -66,17 +66,37 @@ function past_message_residues(bpch::BeliefPropagationCacheHistory, iterations_i
     end
 end
 
-function update_history(bpch::BeliefPropagationCacheHistory,
+# update BeliefPropagationCacheHistory with a new BeliefPropagationCache (can have new network and new messages)
+# and the new message proposals and residuals associated with the new set of messages
+function update_history(
+        bpch::BeliefPropagationCacheHistory,
         new_bpc::BeliefPropagationCache,
         new_message_proposals::Dictionary{NamedEdge, M},
-        new_message_residues::Dictionary{NamedEdge, M}) where M <: Union{ITensor, Vector{ITensor}}
-    
+        new_message_residues::Dictionary{NamedEdge, M};
+        memory_window::Union{Nothing, Int} = nothing
+    ) where M <: Union{ITensor, Vector{ITensor}}
+
+    L = history_length(bpch) # checks validity of bpch
     new_message_history = copy(bpch.message_history)
     push!(new_message_history, copy(messages(new_bpc)))
     new_message_proposal_history = copy(bpch.message_proposal_history)
     push!(new_message_proposal_history, new_message_proposals)
     new_message_residues_history = copy(bpch.message_residues_history)
     push!(new_message_residues_history, new_message_residues)
+
+    # cull excess history if memory_window is specified
+    if !isnothing(memory_window)
+        if memory_window < 0
+            error("The memory window must be a non-negative integer.")
+        else
+            for i in 1:(L + 1 - memory_window)
+                popfirst!(new_message_history)
+                popfirst!(new_message_proposal_history)
+                popfirst!(new_message_residues_history)
+            end
+        end
+    end
+
     return BeliefPropagationCacheHistory(
         new_bpc,
         new_message_history,
@@ -85,22 +105,34 @@ function update_history(bpch::BeliefPropagationCacheHistory,
     )
 end
 
-function update_bpc(bpc::BeliefPropagationCache, new_messages::Dictionary{NamedEdge, M}) where M <: Union{ITensor, Vector{ITensor}}
+# update message/residual/proposal history of BeliefPropagationCacheHistory, while underlying network is untouched
+function update_history(
+        bpch::BeliefPropagationCacheHistory,
+        new_accepted_messages::Dictionary{NamedEdge, M},
+        new_message_proposals::Dictionary{NamedEdge, M},
+        new_message_residues::Dictionary{NamedEdge, M};
+        memory_window::Union{Nothing, Int} = nothing
+    ) where M <: Union{ITensor, Vector{ITensor}}
+    new_bpc = update_bpc_messages(bpch.current_BeliefPropagationCache, new_accepted_messages)
+    return update_history(
+        bpch,
+        new_bpc,
+        new_message_proposals,
+        new_message_residues;
+        memory_window = memory_window,
+    )
+end
+
+function update_bpc_messages(
+        bpc::BeliefPropagationCache{V, N, M},
+        new_messages::Dictionary{NamedEdge, M}
+    ) where {V, N <: AbstractTensorNetwork{V}, M <: Union{ITensor, Vector{ITensor}}}
     return BeliefPropagationCache(
         network(bpc),
         new_messages,
         contraction_sequences(bpc),
         edge_sequence(bpc)
     )
-end
-
-function update_history(
-    bpch::BeliefPropagationCacheHistory,
-    new_accepted_messages::Dictionary{NamedEdge, M},
-    new_message_proposals::Dictionary{NamedEdge, M},
-    new_message_residues::Dictionary{NamedEdge, M}) where M <: Union{ITensor, Vector{ITensor}}
-    new_bpc = update_bpc(bpch.current_BeliefPropagationCache, new_accepted_messages)
-    return update_history(bpch, new_bpc, new_message_proposals, new_message_residues)
 end
 
 function simultaneous_greedy_update(bpc::BeliefPropagationCache{V, N, M}) where {V, N <: AbstractTensorNetwork{V}, M <: Union{ITensor, Vector{ITensor}}}
@@ -112,6 +144,13 @@ function simultaneous_greedy_update(bpc::BeliefPropagationCache{V, N, M}) where 
     end
     message_residues = Dictionary{NamedEdge, M}()
     for e in edge_sequence(bpc)
+        old_inds = collect(ITensors.inds(message(bpc, e)))
+        new_inds = collect(ITensors.inds(message_proposals[e]))
+        old_dims = ITensors.dim.(old_inds)
+        new_dims = ITensors.dim.(new_inds)
+        if Set(old_inds) != Set(new_inds) || old_dims != new_dims
+            error("Inconsistent message indices when computing residues! old_inds=$old_inds, new_inds=$new_inds, old_dims=$old_dims, new_dims=$new_dims.")
+        end
         set!(message_residues, e, message_proposals[e] - message(bpc, e))
     end
     return message_proposals, message_residues
@@ -143,7 +182,7 @@ function anderson_least_squares(
     return alpha
 end
 
-function anderson_accelerated_update_step(
+function update_step_with_anderson_acceleration(
         bpch::BeliefPropagationCacheHistory{V, N, M},
         memory_window::Int, # how many of the previous message updates should be used to construct the Anderson-accelerated update
         #msg_eigenvalue_lower_bound::Dictionary{NamedEdge, Float64}, # lower bound on the eigenvalues of each message
@@ -276,11 +315,8 @@ function messages_are_PD(messages, edges)
     return true
 end
 
-
-
-
-function update_with_anderson_acceleration(
-        network;
+function update_with_anderson_acceleration_cold_start(
+        network::AbstractTensorNetwork;
         memory_window = 5,
         maxiter = 20,
         alphas = nothing,
@@ -288,33 +324,50 @@ function update_with_anderson_acceleration(
         avg_msg_diffs = nothing,
         check_PD = false
     )
+
     # initialize the BeliefPropagationCache and the lower bound on the eigenvalues for each message
     bpc = BeliefPropagationCache(network) 
-    msg_eigenvalue_lower_bound = Dictionary{NamedEdge, Float64}()
     edges = edge_sequence(bpc)
     for e in edges
         m_e = message(bpc, e)
         set!(bpc.messages, e, m_e) # enforces message initialization
-        inds = collect(ITensors.inds(m_e))
-        M =  Array(m_e, inds...)
-        # assuming that m_e = delta up to a normalization
-        set!(msg_eigenvalue_lower_bound, e, real(M[1, 1]))
     end
 
     # initialize the BeliefPropagationCacheHistory
     bpch = BeliefPropagationCacheHistory(bpc)
+    return update_with_anderson_acceleration(
+        bpch;
+        memory_window = memory_window,
+        maxiter = maxiter,
+        alphas = alphas,
+        avg_residual_norms = avg_residual_norms,
+        avg_msg_diffs = avg_msg_diffs,
+        check_PD = check_PD
+    )
+end
 
+
+function update_with_anderson_acceleration(
+        bpch::BeliefPropagationCacheHistory;
+        memory_window = 10,
+        maxiter = 100,
+        alphas = nothing,
+        avg_residual_norms = nothing,
+        avg_msg_diffs = nothing,
+        check_PD = false
+    )
+    edges = edge_sequence(bpch.current_BeliefPropagationCache)
     # start performing Anderson-accelerated message updates and check for convergence or stagnation
     for i in 1:maxiter
         #println("Iteration $i")
         prev_messages = copy(messages(bpch.current_BeliefPropagationCache))
         prev_residuals = i > 1 ? past_message_residues(bpch, 1) : nothing
-        new_accepted_messages, new_message_proposals, new_message_residues = anderson_accelerated_update_step(
+        new_accepted_messages, new_message_proposals, new_message_residues = update_step_with_anderson_acceleration(
             bpch,
             memory_window;
             alphas,
         )
-        bpch = update_history(bpch, new_accepted_messages, new_message_proposals, new_message_residues)
+        bpch = update_history(bpch, new_accepted_messages, new_message_proposals, new_message_residues; memory_window=memory_window)
         
         # report to user
         avg_residual_norm = average_residual_norm(new_message_residues)
@@ -327,39 +380,29 @@ function update_with_anderson_acceleration(
         end
         
         # residuals = 0 implies BP fixed point -> test convergence
-        res_tol = 1e-10
+        res_tol = 1e-8
         if residuals_approx_zero(new_message_residues; tol=res_tol)
             println("Converged after $i iterations (residuals approximately zero).")
-            return bpch.current_BeliefPropagationCache
+            return bpch, true
         end
+        #=
         # check for stagnation based on messages (e.g. because the step size becomes too small)
         msgdiff_tol = 1e-14
         if msgdiff_approx_zero(new_accepted_messages, prev_messages; tol=msgdiff_tol)
             println("Stagnated after $i iterations (message approximately unchanged).")
-            return bpch.current_BeliefPropagationCache
+            return bpch, false
         end
+        =#
         # check for stagnation based on residuals (e.g. because the step size becomes too small)
         res_diff_tol = 1e-14
         if !isnothing(prev_residuals) && residual_diff_approx_zero(new_message_residues, prev_residuals; tol=res_diff_tol)
             println("Stagnated after $i iterations (residual difference approximately zero).")
-            return bpch.current_BeliefPropagationCache
+            return bpch, false
         end
 
         if check_PD && !messages_are_PD(new_accepted_messages, edges)
-            error("Messages no longer PD after iteration $i.")
+            @warn "Messages no longer PD after iteration $i."
+            return bpch, false
         end
     end
-    println("Reached maximum number of iterations ($maxiter) without convergence or stagnation.")
-    return bpch.current_BeliefPropagationCache
 end
-
-
-
-
-
-
-
-
-
-
-
