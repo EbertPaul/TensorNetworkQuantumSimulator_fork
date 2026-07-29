@@ -17,6 +17,7 @@ include("MessagePassing/abstractbeliefpropagationcache.jl")
 include("MessagePassing/beliefpropagationcache.jl")
 include("MessagePassing/boundarympscache.jl")
 include("MessagePassing/loopcorrection.jl")
+include("MessagePassing/andersonacceleration.jl")
 include("graph_ops.jl")
 include("utils.jl")
 
@@ -63,6 +64,7 @@ export
     tensornetworkstate,
     random_tensornetworkstate,
     BeliefPropagationCache,
+    BeliefPropagationCacheHistory,
     rescale!,
     message,
     network,
@@ -125,5 +127,7 @@ export
     rdm,
     norm_factors,
     toriccode_groundstate,
-    ising_partitionfunction
+    ising_partitionfunction,
+    update_with_anderson_acceleration,
+    anderson_accelerated_update_step
 end
