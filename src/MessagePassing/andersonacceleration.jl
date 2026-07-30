@@ -2,47 +2,53 @@ using Base.Threads
 using ITensors: Algorithm
 using Dictionaries: Dictionary, set!
 
-struct BeliefPropagationCacheHistory{V, N <: AbstractTensorNetwork{V}, M <: Union{ITensor, Vector{ITensor}}}
+mutable struct BeliefPropagationCacheHistory{V, N <: AbstractTensorNetwork{V}, M <: Union{ITensor, Vector{ITensor}}}
     current_BeliefPropagationCache::BeliefPropagationCache{V, N, M}      
-    message_history::Vector{Dictionary{NamedEdge, M}}                   # messages that were accepted at different iterations of the message update process
-    message_proposal_history::Vector{Dictionary{NamedEdge, M}}          # messages that were proposed by the greedy update scheme at different iterations of the message update process
-    message_residues_history::Vector{Dictionary{NamedEdge, M}}          # difference between the proposed greedy message update at iteration k and the accepted message at iteration k-1 (zero residue = BP fixed point)
+    vec_edge_sequence::AbstractVector{<:NamedEdge}                      # edge sequence that is use to vectorize message dictionaries (must not be the same as bpc edge sequence)
+    message_proposal_history::Vector{Vector{M}}                         # ring buffer containing proposals
+    message_residues_history::Vector{Vector{M}}                         # ring buffer containing residues
+    history_capacity::Int                                               # number of slots in ring buffer
+    history_len::Int                                                    # number of valid entries currently stored
+    history_head::Int                                                   # index of most recent entry (0 means empty)
 end
 
-function BeliefPropagationCacheHistory(bpc::BeliefPropagationCache{V, N, M}) where {V, N <: AbstractTensorNetwork{V}, M <: Union{ITensor, Vector{ITensor}}}
+function BeliefPropagationCacheHistory(
+        bpc::BeliefPropagationCache{V, N, M};
+        history_capacity::Int = 10,
+    ) where {V, N <: AbstractTensorNetwork{V}, M <: Union{ITensor, Vector{ITensor}}}
+    if history_capacity <= 0
+        error("history_capacity must be a positive integer.")
+    end
+    edges = collect(edge_sequence(bpc))
     return BeliefPropagationCacheHistory(
-        bpc,                   
-        Dictionary{NamedEdge, M}[],
-        Dictionary{NamedEdge, M}[], # cannot be known without information about how the current messages were obtained
-        Dictionary{NamedEdge, M}[], # cannot be known without information about how the current messages were obtained
-        )
+        bpc,
+        edges,
+        Vector{Vector{M}}(undef, history_capacity),
+        Vector{Vector{M}}(undef, history_capacity),
+        history_capacity,
+        0,
+        0,
+    )
 end
 
 function BeliefPropagationCache(bpch::BeliefPropagationCacheHistory)
     return bpch.current_BeliefPropagationCache
 end
 
-function history_length(bpch::BeliefPropagationCacheHistory)
-    ml = length(bpch.message_history)
-    pl = length(bpch.message_proposal_history)
-    rl = length(bpch.message_residues_history)
-    if ml != pl || ml != rl
-        error("The lengths of the message history, message proposal history, and message residues history are inconsistent! Got lengths: message_history=$ml, message_proposal_history=$pl, message_residues_history=$rl")
-    end
-    return ml
+function vec_edge_sequence(bpch::BeliefPropagationCacheHistory)
+    return bpch.vec_edge_sequence
 end
 
-function past_messages(bpch::BeliefPropagationCacheHistory, iterations_into_past::Int)
-    if iterations_into_past < 0
-        error("When accessing prior accepted messages iterations_into_past must be a non-negative integer, where 0 corresponds to the current state of the BeliefPropagationCache.")
+@inline function ring_index(head::Int, iterations_into_past::Int, capacity::Int)
+    return mod1(head - iterations_into_past + 1, capacity)
+end
+
+function history_length(bpch::BeliefPropagationCacheHistory)
+    cl = bpch.history_len
+    if cl < 0 || cl > bpch.history_capacity
+        error("History length is inconsistent with history capacity. Got history_len=$(bpch.history_len), history_capacity=$(bpch.history_capacity).")
     end
-    if iterations_into_past == 0
-        return messages(bpch.current_BeliefPropagationCache)
-    elseif iterations_into_past <= history_length(bpch)
-        return bpch.message_history[end - iterations_into_past + 1]
-    else
-        error("The stored message history contains $(history_length(bpch)) iterations, but you requested a message from $(iterations_into_past) iterations into the past.")
-    end
+    return cl
 end
 
 function past_message_proposals(bpch::BeliefPropagationCacheHistory, iterations_into_past::Int)
@@ -50,7 +56,8 @@ function past_message_proposals(bpch::BeliefPropagationCacheHistory, iterations_
         error("When accessing prior message proposals iterations_into_past must be a positive integer, where 1 corresponds to the most recent proposal that lead to the current state of the BeliefPropagationCache.")
     end
     if iterations_into_past <= history_length(bpch)
-        return bpch.message_proposal_history[end - iterations_into_past + 1]
+        idx = ring_index(bpch.history_head, iterations_into_past, bpch.history_capacity)
+        return bpch.message_proposal_history[idx]
     else
         error("The stored message proposal history contains $(history_length(bpch)) iterations, but you requested a message proposal from $(iterations_into_past) iterations into the past.")
     end
@@ -61,10 +68,29 @@ function past_message_residues(bpch::BeliefPropagationCacheHistory, iterations_i
         error("When accessing prior message residues iterations_into_past must be a positive integer, where 1 corresponds to the most recent residue that lead to the current state of the BeliefPropagationCache.")
     end
     if iterations_into_past <= history_length(bpch)
-        return bpch.message_residues_history[end - iterations_into_past + 1]
+        idx = ring_index(bpch.history_head, iterations_into_past, bpch.history_capacity)
+        return bpch.message_residues_history[idx]
     else
         error("The stored message residues history contains $(history_length(bpch)) iterations, but you requested a message residue from $(iterations_into_past) iterations into the past.")
     end
+end
+
+function push_history!(
+        bpch::BeliefPropagationCacheHistory{V, N, M},
+        new_message_proposals::Vector{M},
+        new_message_residues::Vector{M},
+    ) where {V, N <: AbstractTensorNetwork{V}, M <: Union{ITensor, Vector{ITensor}}}
+    cap = bpch.history_capacity
+    if bpch.history_len < cap
+        idx = bpch.history_len + 1
+        bpch.history_len += 1
+    else
+        idx = (bpch.history_head % cap) + 1
+    end
+    bpch.message_proposal_history[idx] = new_message_proposals
+    bpch.message_residues_history[idx] = new_message_residues
+    bpch.history_head = idx
+    return bpch
 end
 
 # update BeliefPropagationCacheHistory with a new BeliefPropagationCache (can have new network and new messages)
@@ -72,47 +98,24 @@ end
 function update_history(
         bpch::BeliefPropagationCacheHistory,
         new_bpc::BeliefPropagationCache,
-        new_message_proposals::Dictionary{NamedEdge, M},
-        new_message_residues::Dictionary{NamedEdge, M};
-        memory_window::Union{Nothing, Int} = nothing
+        new_message_proposals::Vector{M},
+        new_message_residues::Vector{M};
     ) where M <: Union{ITensor, Vector{ITensor}}
 
-    L = history_length(bpch) # checks validity of bpch
-    new_message_history = copy(bpch.message_history)
-    push!(new_message_history, copy(messages(new_bpc)))
-    new_message_proposal_history = copy(bpch.message_proposal_history)
-    push!(new_message_proposal_history, new_message_proposals)
-    new_message_residues_history = copy(bpch.message_residues_history)
-    push!(new_message_residues_history, new_message_residues)
-
-    # cull excess history if memory_window is specified
-    if !isnothing(memory_window)
-        if memory_window < 0
-            error("The memory window must be a non-negative integer.")
-        else
-            for i in 1:(L + 1 - memory_window)
-                popfirst!(new_message_history)
-                popfirst!(new_message_proposal_history)
-                popfirst!(new_message_residues_history)
-            end
-        end
+    new_edge_sequence = collect(edge_sequence(new_bpc))
+    if new_edge_sequence != vec_edge_sequence(bpch)
+        error("Cannot update BeliefPropagationCacheHistory with new BeliefPropagationCache: edge_sequence changed.")
     end
-
-    return BeliefPropagationCacheHistory(
-        new_bpc,
-        new_message_history,
-        new_message_proposal_history,
-        new_message_residues_history
-    )
+    bpch.current_BeliefPropagationCache = new_bpc
+    return push_history!(bpch, new_message_proposals, new_message_residues)
 end
 
 # update message/residual/proposal history of BeliefPropagationCacheHistory, while underlying network is untouched
 function update_history(
         bpch::BeliefPropagationCacheHistory,
-        new_accepted_messages::Dictionary{NamedEdge, M},
-        new_message_proposals::Dictionary{NamedEdge, M},
-        new_message_residues::Dictionary{NamedEdge, M};
-        memory_window::Union{Nothing, Int} = nothing
+        new_accepted_messages::Vector{M},
+        new_message_proposals::Vector{M},
+        new_message_residues::Vector{M};
     ) where M <: Union{ITensor, Vector{ITensor}}
     new_bpc = update_bpc_messages(bpch.current_BeliefPropagationCache, new_accepted_messages)
     return update_history(
@@ -120,24 +123,33 @@ function update_history(
         new_bpc,
         new_message_proposals,
         new_message_residues;
-        memory_window = memory_window,
     )
 end
 
 function update_bpc_messages(
         bpc::BeliefPropagationCache{V, N, M},
-        new_messages::Dictionary{NamedEdge, M}
+        new_messages::Vector{M}
     ) where {V, N <: AbstractTensorNetwork{V}, M <: Union{ITensor, Vector{ITensor}}}
+    es = collect(edge_sequence(bpc))
+    if length(new_messages) != length(es)
+        error("Encountered message vector of length $(length(new_messages)) but edge_sequence has length $(length(es)).")
+    end
+    new_messages_dict = Dictionary{NamedEdge, M}()
+    for i in eachindex(es)
+        set!(new_messages_dict, es[i], new_messages[i])
+    end
     return BeliefPropagationCache(
         network(bpc),
-        new_messages,
+        new_messages_dict,
         contraction_sequences(bpc),
         edge_sequence(bpc)
     )
 end
 
-function simultaneous_greedy_update(bpc::BeliefPropagationCache{V, N, M}) where {V, N <: AbstractTensorNetwork{V}, M <: Union{ITensor, Vector{ITensor}}}
-    es = collect(edge_sequence(bpc))
+function simultaneous_greedy_update(
+    bpc::BeliefPropagationCache{V, N, M},
+    es::AbstractVector{<:NamedEdge}
+    ) where {V, N <: AbstractTensorNetwork{V}, M <: Union{ITensor, Vector{ITensor}}}
     n = length(es)
     update_alg = set_default_kwargs(Algorithm(default_message_update_alg(bpc)), bpc)
     message_proposal_vec = Vector{M}(undef, n) # use vector for thread safety
@@ -150,18 +162,11 @@ function simultaneous_greedy_update(bpc::BeliefPropagationCache{V, N, M}) where 
         old_message = message(bpc, e)
         message_residue_vec[i] = new_message - old_message
     end
-    # assign to dictionary in serial fashion to avoid thread problems
-    message_proposals = Dictionary{NamedEdge, M}()
-    message_residues = Dictionary{NamedEdge, M}()
-    for i in eachindex(es)
-        set!(message_proposals, es[i], message_proposal_vec[i])
-        set!(message_residues, es[i], message_residue_vec[i])
-    end
-    return message_proposals, message_residues
+    return message_proposal_vec, message_residue_vec
 end
 
 function anderson_least_squares(
-        residues::Vector{Dictionary{NamedEdge, M}},
+    residues::Vector{Vector{M}},
         edges::AbstractVector{<:NamedEdge};
         threaded = true
     ) where M <: Union{ITensor, Vector{ITensor}}
@@ -171,8 +176,8 @@ function anderson_least_squares(
         for i in 1:N
             for j in i:N
                 Cij = 0.0
-                for e in edges
-                    Cij += real(scalar(dag(residues[i][e]) * residues[j][e]))
+                for e_idx in eachindex(edges)
+                    Cij += real(scalar(dag(residues[i][e_idx]) * residues[j][e_idx]))
                 end
                 C[i, j] = Cij
                 C[j, i] = Cij
@@ -183,8 +188,8 @@ function anderson_least_squares(
         Threads.@threads :greedy for i in 1:N
             for j in i:N
                 Cij = 0.0
-                for e in edges
-                    Cij += real(scalar(dag(residues[i][e]) * residues[j][e]))
+                for e_idx in eachindex(edges)
+                    Cij += real(scalar(dag(residues[i][e_idx]) * residues[j][e_idx]))
                 end
                 C[i, j] = Cij
                 C[j, i] = Cij
@@ -204,19 +209,17 @@ end
 function update_step_with_anderson_acceleration(
         bpch::BeliefPropagationCacheHistory{V, N, M},
         memory_window::Int, # how many of the previous message updates should be used to construct the Anderson-accelerated update
-        #msg_eigenvalue_lower_bound::Dictionary{NamedEdge, Float64}, # lower bound on the eigenvalues of each message
         ;
         alphas = nothing,
     ) where {V, N <: AbstractTensorNetwork{V}, M <: Union{ITensor, Vector{ITensor}}}
 
-    current_messages = messages(bpch.current_BeliefPropagationCache)
-    new_message_proposals, new_message_residues = simultaneous_greedy_update(bpch.current_BeliefPropagationCache)
+    vec_edge_seq = vec_edge_sequence(bpch)
+    n_edges = length(vec_edge_seq)
+    new_message_proposals, new_message_residues = simultaneous_greedy_update(bpch.current_BeliefPropagationCache, vec_edge_seq)
     n_prev = min(memory_window, history_length(bpch)) # number of previous update steps that are taken into account
-    edges = collect(edge_sequence(bpch.current_BeliefPropagationCache))
-    n_edges = length(edges)
     
-    proposals = Vector{Dictionary{NamedEdge, M}}(undef, n_prev + 1)
-    residues = Vector{Dictionary{NamedEdge, M}}(undef, n_prev + 1)
+    proposals = Vector{Vector{M}}(undef, n_prev + 1)
+    residues = Vector{Vector{M}}(undef, n_prev + 1)
     proposals[1] = new_message_proposals
     residues[1] = new_message_residues
     for i in 1:n_prev
@@ -225,111 +228,92 @@ function update_step_with_anderson_acceleration(
     end
 
     # solve the least-squares problem to find optimal linear combination of the current and the M previous message proposals
-    alpha = anderson_least_squares(residues, edges)
+    alpha = anderson_least_squares(residues, vec_edge_seq)
     if !isnothing(alphas)
         push!(alphas, copy(alpha))
     end
 
-    # construct the Anderson-accelerated message update
-    anderson_message_proposals_vec = Vector{M}(undef, n_edges)
-    anderson_message_proposals = Dictionary{NamedEdge, M}()
-    
+    # construct the Anderson-accelerated message update and accept directly, although it may not be PD
+    new_accepted_messages = Vector{M}(undef, n_edges)
     Threads.@threads :greedy for e_idx in 1:n_edges
-        e = edges[e_idx]
-        m_AA = sum(alpha[i] * proposals[i][e] for i in 1:(n_prev + 1))
+        m_AA = sum(alpha[i] * proposals[i][e_idx] for i in 1:(n_prev + 1))
         m_AA = make_hermitian(m_AA)
         m_norm = tr(m_AA)
-        anderson_message_proposals_vec[e_idx] = m_AA / m_norm
+        new_accepted_messages[e_idx] = m_AA / m_norm
     end
-
-    # take m_AA as the actual accepted messages although they may not be positive definite
-    # not thread-parallelized because of dictionary
-    new_accepted_messages = Dictionary{NamedEdge, M}()
-    for (e_idx, e) in enumerate(edges)
-        set!(new_accepted_messages, e, anderson_message_proposals_vec[e_idx])
-    end
-
-    #=
-
-    # Anderson-accelerated message need not to be positive definite (entries of alpha can be negative!), so implement safeguard mechanism
-    # -> find beta for which the update m_e + beta * (m_AA - m_e) is positive definite for all edges e
-    beta = 1
-    theta = 0.8 # safeguard parameter between 0 (useless) and 1 (most risky)
-    D_e_Frob_dict = Dictionary{NamedEdge, Float64}()
-    for e in edges
-        delta_e = msg_eigenvalue_lower_bound[e]
-        D_e = anderson_message_proposals[e] - current_messages[e]
-        D_e_Frob = sqrt(real(scalar(dag(D_e) * D_e)))
-        beta_e = iszero(D_e_Frob) ? 1.0 : theta * delta_e / D_e_Frob
-        beta = min(beta, beta_e)
-        set!(D_e_Frob_dict, e, D_e_Frob)
-    end
-
-    # contruct the actual message update with PD safeguard taken into account
-    new_accepted_messages = Dictionary{NamedEdge, M}()
-    for e in edges
-        set!(new_accepted_messages, e, current_messages[e] + beta * (anderson_message_proposals[e] - current_messages[e]))
-    end
-
-    # update the msg_engenvalue_lower_bound for the next iteration
-    new_msg_eigenvalue_lower_bound = Dictionary{NamedEdge, Float64}()
-    for e in edges
-        set!(new_msg_eigenvalue_lower_bound, e, msg_eigenvalue_lower_bound[e] - beta * D_e_Frob_dict[e])
-        if new_msg_eigenvalue_lower_bound[e] < 0
-            @warn "The lower bound on the eigenvalue of the message along edge $e has become negative: $(new_msg_eigenvalue_lower_bound[e]). This should not happen under any circumstances!"
-        end
-    end
-    =#
 
     return new_accepted_messages, new_message_proposals, new_message_residues
 end
 
-function residuals_approx_zero(residuals::Dictionary{NamedEdge, M}; tol::Float64 = 1e-8) where M <: Union{ITensor, Vector{ITensor}}
-    for e in keys(residuals)
-        if norm(residuals[e]) > tol
+function residuals_approx_zero(res::Vector{M}; tol::Float64 = 1e-8) where M <: Union{ITensor, Vector{ITensor}}
+    for i in eachindex(res)
+        if norm(res[i]) > tol
             return false
         end
     end
     return true
 end
 
-function residual_diff_approx_zero(residuals_a::Dictionary{NamedEdge, M}, residuals_b::Dictionary{NamedEdge, M}; tol::Float64 = 1e-8) where M <: Union{ITensor, Vector{ITensor}}
-    for e in keys(residuals_a)
-        if norm(residuals_a[e] - residuals_b[e]) > tol
+function residual_diff_approx_zero(
+        res_a::Vector{M1},
+        res_b::Vector{M2};
+        tol::Float64 = 1e-8
+    ) where {M1 <: Union{ITensor, Vector{ITensor}}, M2 <: Union{ITensor, Vector{ITensor}}}
+    if length(res_a) != length(res_b)
+        error("Encountered message vectors of different lengths: $(length(res_a)) and $(length(res_b)).")
+    end
+    for i in eachindex(res_a, res_b)
+        if norm(res_a[i] - res_b[i]) > tol
             return false
         end
     end
     return true
 end
 
-function msgdiff_approx_zero(msgs_a::Dictionary{NamedEdge, M}, msgs_b::Dictionary{NamedEdge, M}; tol::Float64 = 1e-8) where M <: Union{ITensor, Vector{ITensor}}
-    for e in keys(msgs_a)
-        if message_diff(msgs_a[e], msgs_b[e]) > tol
+function msgdiff_approx_zero(
+        msgs_a::Vector{M1},
+        msgs_b::Vector{M2};
+        tol::Float64 = 1e-8
+    ) where {M1 <: Union{ITensor, Vector{ITensor}}, M2 <: Union{ITensor, Vector{ITensor}}}
+    if length(msgs_a) != length(msgs_b)
+        error("Encountered message vectors of different lengths: $(length(msgs_a)) and $(length(msgs_b)).")
+    end
+    for i in eachindex(msgs_a)
+        if message_diff(msgs_a[i], msgs_b[i]) > tol
             return false
         end
     end
     return true
 end
 
-function average_residual_norm(residuals::Dictionary{NamedEdge, M}) where M <: Union{ITensor, Vector{ITensor}}
+function average_residual_norm(res::Vector{M}) where M <: Union{ITensor, Vector{ITensor}}
     total_norm = 0.0
-    for e in keys(residuals)
-        total_norm += norm(residuals[e])
+    for i in eachindex(res)
+        total_norm += norm(res[i])
     end
-    return total_norm / length(keys(residuals))
+    return total_norm / length(res)
 end
 
-function average_message_diff(msgs_a::Dictionary{NamedEdge, M}, msgs_b::Dictionary{NamedEdge, M}) where M <: Union{ITensor, Vector{ITensor}}
-    total_diff = 0.0
-    for e in keys(msgs_a)
-        total_diff += message_diff(msgs_a[e], msgs_b[e])
+function average_message_diff(
+        msgs_a::Vector{M1},
+        msgs_b::Vector{M2}
+    ) where {M1 <: Union{ITensor, Vector{ITensor}}, M2 <: Union{ITensor, Vector{ITensor}}}
+    if length(msgs_a) != length(msgs_b)
+        error("Encountered message vectors of different lengths: $(length(msgs_a)) and $(length(msgs_b)).")
     end
-    return total_diff / length(keys(msgs_a))
+    total_diff = 0.0
+    for i in eachindex(msgs_a)
+        total_diff += message_diff(msgs_a[i], msgs_b[i])
+    end
+    return total_diff / length(msgs_a)
 end
 
 function messages_are_PD(messages, edges)
-    for e in edges
-        m = messages[e]
+    if length(messages) != length(edges)
+        error("Encountered message vector of length $(length(messages)) but edge_sequence has length $(length(edges)).")
+    end
+    for i in eachindex(edges)
+        m = messages[i]
         inds = collect(ITensors.inds(m))
         M =  Array(m, inds...)
         if !isposdef(M)
@@ -358,7 +342,7 @@ function update_with_anderson_acceleration_cold_start(
     end
 
     # initialize the BeliefPropagationCacheHistory
-    bpch = BeliefPropagationCacheHistory(bpc)
+    bpch = BeliefPropagationCacheHistory(bpc; history_capacity = memory_window)
     return update_with_anderson_acceleration(
         bpch;
         memory_window = memory_window,
@@ -380,18 +364,18 @@ function update_with_anderson_acceleration(
         avg_msg_diffs = nothing,
         check_PD = false
     )
-    edges = edge_sequence(bpch.current_BeliefPropagationCache)
+    edges = vec_edge_sequence(bpch)
     # start performing Anderson-accelerated message updates and check for convergence or stagnation
     for i in 1:maxiter
         #println("Iteration $i")
-        prev_messages = copy(messages(bpch.current_BeliefPropagationCache))
+        prev_messages = [message(bpch.current_BeliefPropagationCache, e) for e in edges]
         prev_residuals = i > 1 ? past_message_residues(bpch, 1) : nothing
         new_accepted_messages, new_message_proposals, new_message_residues = update_step_with_anderson_acceleration(
             bpch,
             memory_window;
             alphas,
         )
-        bpch = update_history(bpch, new_accepted_messages, new_message_proposals, new_message_residues; memory_window=memory_window)
+        bpch = update_history(bpch, new_accepted_messages, new_message_proposals, new_message_residues)
         
         # report to user
         avg_residual_norm = average_residual_norm(new_message_residues)
