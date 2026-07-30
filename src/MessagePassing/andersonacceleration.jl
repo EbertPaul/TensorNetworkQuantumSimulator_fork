@@ -1,3 +1,4 @@
+using Base.Threads
 using ITensors: Algorithm
 using Dictionaries: Dictionary, set!
 
@@ -136,40 +137,58 @@ function update_bpc_messages(
 end
 
 function simultaneous_greedy_update(bpc::BeliefPropagationCache{V, N, M}) where {V, N <: AbstractTensorNetwork{V}, M <: Union{ITensor, Vector{ITensor}}}
-    message_proposals = Dictionary{NamedEdge, M}()
+    es = collect(edge_sequence(bpc))
+    n = length(es)
     update_alg = set_default_kwargs(Algorithm(default_message_update_alg(bpc)), bpc)
-    for e in edge_sequence(bpc)
-        m, (cache_key, sequence, seq_changed) = updated_message(update_alg, bpc, e)
-        set!(message_proposals, e, m)
+    message_proposal_vec = Vector{M}(undef, n) # use vector for thread safety
+    message_residue_vec = Vector{M}(undef, n) # use vector for thread safety
+    # carry out contractions in prallel threads
+    Threads.@threads :greedy for i in eachindex(es)
+        e = es[i]
+        new_message, _ = updated_message(update_alg, bpc, e)
+        message_proposal_vec[i] = new_message
+        old_message = message(bpc, e)
+        message_residue_vec[i] = new_message - old_message
     end
+    # assign to dictionary in serial fashion to avoid thread problems
+    message_proposals = Dictionary{NamedEdge, M}()
     message_residues = Dictionary{NamedEdge, M}()
-    for e in edge_sequence(bpc)
-        old_inds = collect(ITensors.inds(message(bpc, e)))
-        new_inds = collect(ITensors.inds(message_proposals[e]))
-        old_dims = ITensors.dim.(old_inds)
-        new_dims = ITensors.dim.(new_inds)
-        if Set(old_inds) != Set(new_inds) || old_dims != new_dims
-            error("Inconsistent message indices when computing residues! old_inds=$old_inds, new_inds=$new_inds, old_dims=$old_dims, new_dims=$new_dims.")
-        end
-        set!(message_residues, e, message_proposals[e] - message(bpc, e))
+    for i in eachindex(es)
+        set!(message_proposals, es[i], message_proposal_vec[i])
+        set!(message_residues, es[i], message_residue_vec[i])
     end
     return message_proposals, message_residues
 end
 
 function anderson_least_squares(
-        residues::AbstractVector{<:Dictionary{NamedEdge, Union{ITensor, Vector{ITensor}}}},
-        edges::AbstractVector{<:NamedEdge},
-    )
+        residues::Vector{Dictionary{NamedEdge, M}},
+        edges::AbstractVector{<:NamedEdge};
+        threaded = true
+    ) where M <: Union{ITensor, Vector{ITensor}}
     N = length(residues) # M + 1 = number of message proposals from the past + the current one
     C = zeros(N + 1, N + 1)
-    for i in 1:N
-        for j in i:N
-            Cij = 0.0
-            for e in edges
-                Cij += real(scalar(dag(residues[i][e]) * residues[j][e]))
+    if !threaded
+        for i in 1:N
+            for j in i:N
+                Cij = 0.0
+                for e in edges
+                    Cij += real(scalar(dag(residues[i][e]) * residues[j][e]))
+                end
+                C[i, j] = Cij
+                C[j, i] = Cij
             end
-            C[i, j] = Cij
-            C[j, i] = Cij
+        end
+    else
+        
+        Threads.@threads :greedy for i in 1:N
+            for j in i:N
+                Cij = 0.0
+                for e in edges
+                    Cij += real(scalar(dag(residues[i][e]) * residues[j][e]))
+                end
+                C[i, j] = Cij
+                C[j, i] = Cij
+            end
         end
     end
     C[N + 1, 1:N] .= 1.0 # extend C to incorporate the sum(alpha) = 1 contraint
@@ -193,38 +212,43 @@ function update_step_with_anderson_acceleration(
     current_messages = messages(bpch.current_BeliefPropagationCache)
     new_message_proposals, new_message_residues = simultaneous_greedy_update(bpch.current_BeliefPropagationCache)
     n_prev = min(memory_window, history_length(bpch)) # number of previous update steps that are taken into account
-    proposals = [new_message_proposals]
-    residues = [new_message_residues]
+    edges = collect(edge_sequence(bpch.current_BeliefPropagationCache))
+    n_edges = length(edges)
+    
+    proposals = Vector{Dictionary{NamedEdge, M}}(undef, n_prev + 1)
+    residues = Vector{Dictionary{NamedEdge, M}}(undef, n_prev + 1)
+    proposals[1] = new_message_proposals
+    residues[1] = new_message_residues
     for i in 1:n_prev
-        push!(proposals, past_message_proposals(bpch, i))
-        push!(residues, past_message_residues(bpch, i))
+        proposals[i + 1] = past_message_proposals(bpch, i)
+        residues[i + 1] = past_message_residues(bpch, i)
     end
 
     # solve the least-squares problem to find optimal linear combination of the current and the M previous message proposals
-    edges = edge_sequence(bpch.current_BeliefPropagationCache)
     alpha = anderson_least_squares(residues, edges)
     if !isnothing(alphas)
         push!(alphas, copy(alpha))
     end
 
     # construct the Anderson-accelerated message update
+    anderson_message_proposals_vec = Vector{M}(undef, n_edges)
     anderson_message_proposals = Dictionary{NamedEdge, M}()
-    for e in edges
+    
+    Threads.@threads :greedy for e_idx in 1:n_edges
+        e = edges[e_idx]
         m_AA = sum(alpha[i] * proposals[i][e] for i in 1:(n_prev + 1))
         m_AA = make_hermitian(m_AA)
         m_norm = tr(m_AA)
-        if iszero(m_norm)
-            set!(anderson_message_proposals, e, current_messages[e])
-        else
-            set!(anderson_message_proposals, e, m_AA / m_norm)
-        end
+        anderson_message_proposals_vec[e_idx] = m_AA / m_norm
     end
 
     # take m_AA as the actual accepted messages although they may not be positive definite
+    # not thread-parallelized because of dictionary
     new_accepted_messages = Dictionary{NamedEdge, M}()
-    for e in edges
-        set!(new_accepted_messages, e, anderson_message_proposals[e])
+    for (e_idx, e) in enumerate(edges)
+        set!(new_accepted_messages, e, anderson_message_proposals_vec[e_idx])
     end
+
     #=
 
     # Anderson-accelerated message need not to be positive definite (entries of alpha can be negative!), so implement safeguard mechanism
