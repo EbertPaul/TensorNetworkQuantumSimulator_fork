@@ -157,7 +157,7 @@ function update_history!(
         dot_msg_diffs = Vector{Float64}(undef, length(vec_edge_seq))
         Threads.@threads :greedy for i in eachindex(vec_edge_seq)
             subtr_msg_diffs[i] = norm(index_safe_message_subtract(new_messages[i], prev_messages[i]))
-            dot_msg_diffs[i] = message_diff(new_messages[i], prev_messages[i])
+            dot_msg_diffs[i] = sqrt(message_diff(new_messages[i], prev_messages[i]))
         end
     end
     # mutate bpch object
