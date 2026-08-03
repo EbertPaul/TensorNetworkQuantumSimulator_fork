@@ -131,5 +131,7 @@ export
     update_with_anderson_acceleration,
     update_step_with_anderson_acceleration,
     update_with_anderson_acceleration_cold_start,
-    update_history
+    update_history,
+    vec_edge_sequence,
+    predictor_step_initialization
 end
