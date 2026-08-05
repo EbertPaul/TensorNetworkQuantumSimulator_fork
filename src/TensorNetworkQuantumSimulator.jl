@@ -132,6 +132,8 @@ export
     update_with_anderson_acceleration,
     update_history,
     vec_edge_sequence,
+    # the edge priority stuff
+    residual_queue_sequential_update,
     # the gradient stuff
     BPTraceGradientResult,
     bp_trace_residual_loss_and_gradient,

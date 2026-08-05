@@ -326,6 +326,7 @@ end
 
 function update_with_anderson_acceleration(
         bpc::BeliefPropagationCache;
+        verbose::Bool = false,
         memory_window = 10,
         maxiter = 100,
         alphas = nothing,
@@ -383,7 +384,9 @@ function update_with_anderson_acceleration(
             push!(avg_dot_msg_diffs, avg_dot_msg_diff)
         end
         if avg_residual_norm  <= residual_tol
-            println("Converged after $i iterations (residuals approximately zero).")
+            if verbose
+                println("Converged after $i iterations (residuals approximately zero).")
+            end
             return bpch, true, i
         end
         check_PD_with_threading = false
@@ -394,4 +397,83 @@ function update_with_anderson_acceleration(
     end
     @warn "Anderson acceleration did not converge after $maxiter iterations."
     return bpch, false, maxiter
+end
+
+# update function similar to standard/greedy update but with residual priority queue and Anderson ac
+function residual_queue_sequential_update(
+        alg::Algorithm"bp",
+        bpc::BeliefPropagationCache;
+        verbose::Bool = false,
+        maxiter = 100,
+        avg_residual_norms = nothing,
+        max_residual_norms = nothing,
+        avg_subtr_msg_diffs = nothing,
+        avg_dot_msg_diffs = nothing,
+        residual_tol::Float64 = default_residual_tol(),
+        residual_diff_tol::Float64 = default_residual_diff_tol(),
+        msgdiff_tol::Float64 = default_msgdiff_tol(),
+    )
+    bpc = copy(bpc)
+    invalidate_contraction_sequences!(bpc)
+    converged = false
+   
+    edge_seq = edge_sequence(bpc) # initialize some edge sequence here, because residuals are not available yet
+    update_alg = set_default_kwargs(Algorithm(default_message_update_alg(bpc)), bpc)
+    for i in 1:maxiter
+        # perform sequential update along edge sequence and update the edge sequence based on the norm of the residuals
+        edge_seq, res_norms, dot_msg_diff = update_iteration_residue_priority!(alg, bpc, edge_seq; update_alg = update_alg)
+        subtr_msg_diffs = res_norms # since this is the greedy update the message difference is equal to the residual
+
+        # ----- monitoring -----
+        avg_residual_norm = mean(res_norms)
+        max_residual_norm = maximum(res_norms)
+        avg_subtr_msg_diff = mean(subtr_msg_diffs)
+        avg_dot_msg_diff = mean(dot_msg_diff)
+        if !isnothing(avg_residual_norms)
+            push!(avg_residual_norms, avg_residual_norm)
+        end
+        if !isnothing(max_residual_norms)
+            push!(max_residual_norms, max_residual_norm)
+        end
+        if !isnothing(avg_subtr_msg_diffs)
+            push!(avg_subtr_msg_diffs, avg_subtr_msg_diff)
+        end
+        if !isnothing(avg_dot_msg_diffs)
+            push!(avg_dot_msg_diffs, avg_dot_msg_diff)
+        end
+        if avg_residual_norm  <= residual_tol
+            if verbose
+                println("Converged after $i iterations (residuals approximately zero).")
+            end
+            invalidate_contraction_sequences!(bpc)
+            return bpc, true, i
+        end
+    end
+    @warn "Residual queue sequential update did not converge after $maxiter iterations."
+    invalidate_contraction_sequences!(bpc)
+    return bpc, false, maxiter
+end
+
+function residual_queue_sequential_update(bpc::AbstractBeliefPropagationCache; alg = default_update_alg(bpc), kwargs...)
+    return residual_queue_sequential_update(set_default_kwargs(Algorithm(alg), bpc), bpc; kwargs...)
+end
+
+function update_iteration_residue_priority!(
+        alg::Algorithm"bp",
+        bpc::AbstractBeliefPropagationCache,
+        edges::AbstractVector{<:NamedEdge};
+        update_alg = set_default_kwargs(Algorithm(default_message_update_alg(bpc)), bpc)
+    )
+    res_norms = Float64[]
+    dot_msg_diff = Float64[]
+    for e in edges
+        prev_message = message(bpc, e)
+        new_message, (cache_key, sequence, seq_changed) = updated_message(update_alg, bpc, e)
+        seq_changed && set!(contraction_sequences(bpc), cache_key, sequence)
+        setmessage!(bpc, e, new_message)
+        push!(res_norms, norm(new_message - prev_message))
+        push!(dot_msg_diff, sqrt(max(message_diff(new_message, prev_message), 0.0)))
+    end
+    edge_perm = sortperm(res_norms, rev = true)
+    return edges[edge_perm], res_norms[edge_perm], dot_msg_diff[edge_perm]
 end
