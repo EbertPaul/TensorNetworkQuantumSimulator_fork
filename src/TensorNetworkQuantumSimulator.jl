@@ -128,7 +128,15 @@ export
     norm_factors,
     toriccode_groundstate,
     ising_partitionfunction,
+    # the anderson update stuff
     update_with_anderson_acceleration,
     update_history,
     vec_edge_sequence,
+    # the gradient stuff
+    BPTraceGradientResult,
+    bp_trace_residual_loss_and_gradient,
+    additive_gradient_step!,
+    loss_only_trace_residual,
+    default_local_bp_factor,
+    check_local_raw_update
 end

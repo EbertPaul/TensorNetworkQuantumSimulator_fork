@@ -157,7 +157,7 @@ function update_history!(
         dot_msg_diffs = Vector{Float64}(undef, length(vec_edge_seq))
         Threads.@threads :greedy for i in eachindex(vec_edge_seq)
             subtr_msg_diffs[i] = norm(index_safe_message_subtract(new_messages[i], prev_messages[i]))
-            dot_msg_diffs[i] = sqrt(message_diff(new_messages[i], prev_messages[i]))
+            dot_msg_diffs[i] = sqrt(max(message_diff(new_messages[i], prev_messages[i]), 0.0))
         end
     end
     # mutate bpch object
@@ -337,6 +337,7 @@ function update_with_anderson_acceleration(
         residual_tol::Float64 = default_residual_tol(),
         residual_diff_tol::Float64 = default_residual_diff_tol(),
         msgdiff_tol::Float64 = default_msgdiff_tol(),
+        greedy_steps::Int = 0
     )
     vec_edge_seq = collect(edge_sequence(bpc))
     # initialize anderson acceleration with one greedy update step
@@ -348,13 +349,22 @@ function update_with_anderson_acceleration(
     u1, r1 = simultaneous_greedy_update(bpc, vec_edge_seq; update_alg = update_alg)
     bpch = BeliefPropagationCacheHistory(bpc, x0, x1, u0, u1, r0, r1; history_capacity = memory_window)
     # start Anderson update loop
+    greedy_steps_done = 0
     for i in 2:maxiter
-        AA_messages = anderson_acceleration_update(
-            bpch,
-            memory_window;
-            alphas,
-        )
-        res_norms, subtr_msg_diffs, dot_msg_diffs = update_history!(bpch, AA_messages; return_msgdiff = true)
+        if greedy_steps_done < greedy_steps
+            greedy_steps_done += 1
+            bpc = BeliefPropagationCache(bpch)
+            uk, rk = simultaneous_greedy_update(bpc, vec_edge_seq; update_alg = update_alg)
+            new_messages = uk
+        else
+            new_messages = anderson_acceleration_update(
+                bpch,
+                memory_window;
+                alphas,
+            )
+        end
+        res_norms, subtr_msg_diffs, dot_msg_diffs = update_history!(bpch, new_messages; return_msgdiff = true)
+        
         # ----- monitoring -----
         avg_residual_norm = mean(res_norms)
         max_residual_norm = maximum(res_norms)
@@ -374,12 +384,14 @@ function update_with_anderson_acceleration(
         end
         if avg_residual_norm  <= residual_tol
             println("Converged after $i iterations (residuals approximately zero).")
-            return bpch, true
+            return bpch, true, i
         end
         check_PD_with_threading = false
-        if check_PD && !messages_are_PD(AA_messages; threaded=check_PD_with_threading)
+        if check_PD && !messages_are_PD(new_messages; threaded=check_PD_with_threading)
             @warn "Messages no longer PD after iteration $i."
-            return bpch, false
+            return bpch, false, i
         end
     end
+    @warn "Anderson acceleration did not converge after $maxiter iterations."
+    return bpch, false, maxiter
 end
