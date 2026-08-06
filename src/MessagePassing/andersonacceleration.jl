@@ -134,7 +134,8 @@ end
 function update_history!(
         bpch::BeliefPropagationCacheHistory{V, N, M},
         new_messages::Vector{M};
-        return_msgdiff = false
+        return_msgdiff = false,
+        threading = true
     ) where {V, N <: AbstractTensorNetwork{V}, M <: Union{ITensor, Vector{ITensor}}}
     # save prev_messages for later msgdiff computation if requested
     vec_edge_seq = vec_edge_sequence(bpch)
@@ -149,15 +150,22 @@ function update_history!(
     # update bpc and get residues of the new messages
     new_bpc = update_bpc_messages(BeliefPropagationCache(bpch), new_messages, vec_edge_seq)
     update_alg = set_default_kwargs(Algorithm(default_message_update_alg(new_bpc)), new_bpc)
-    greedy_steps, greedy_residues = simultaneous_greedy_update(new_bpc, vec_edge_seq; update_alg = update_alg)
+    greedy_steps, greedy_residues = simultaneous_greedy_update(new_bpc, vec_edge_seq; update_alg = update_alg, threading = threading)
     # compute monitoring diagnostics
     res_norms = norm.(greedy_residues)
     if return_msgdiff
         subtr_msg_diffs = Vector{Float64}(undef, length(vec_edge_seq))
         dot_msg_diffs = Vector{Float64}(undef, length(vec_edge_seq))
-        Threads.@threads :greedy for i in eachindex(vec_edge_seq)
-            subtr_msg_diffs[i] = norm(index_safe_message_subtract(new_messages[i], prev_messages[i]))
-            dot_msg_diffs[i] = sqrt(max(message_diff(new_messages[i], prev_messages[i]), 0.0))
+        if threading
+            Threads.@threads :greedy for i in eachindex(vec_edge_seq)
+                subtr_msg_diffs[i] = norm(index_safe_message_subtract(new_messages[i], prev_messages[i]))
+                dot_msg_diffs[i] = sqrt(max(message_diff(new_messages[i], prev_messages[i]), 0.0))
+            end
+        else
+            for i in eachindex(vec_edge_seq)
+                subtr_msg_diffs[i] = norm(index_safe_message_subtract(new_messages[i], prev_messages[i]))
+                dot_msg_diffs[i] = sqrt(max(message_diff(new_messages[i], prev_messages[i]), 0.0))
+            end
         end
     end
     # mutate bpch object
@@ -209,20 +217,31 @@ function index_safe_message_subtract(m_a::ITensor, m_b::ITensor)
 end
 
 function simultaneous_greedy_update(
-    bpc::BeliefPropagationCache{V, N, M},
-    es::AbstractVector{<:NamedEdge};
-    update_alg = set_default_kwargs(Algorithm(default_message_update_alg(bpc)), bpc)
+        bpc::BeliefPropagationCache{V, N, M},
+        es::AbstractVector{<:NamedEdge};
+        update_alg = set_default_kwargs(Algorithm(default_message_update_alg(bpc)), bpc),
+        threading = true,
     ) where {V, N <: AbstractTensorNetwork{V}, M <: Union{ITensor, Vector{ITensor}}}
     n = length(es)
     greedy_msgs = Vector{M}(undef, n) # use vector for thread safety
     greedy_residues = Vector{M}(undef, n) # use vector for thread safety
     # carry out contractions in prallel threads
-    Threads.@threads :greedy for i in eachindex(es)
-        e = es[i]
-        new_message, _ = updated_message(update_alg, bpc, e)
-        old_message = message(bpc, e)
-        greedy_msgs[i] = new_message
-        greedy_residues[i] = index_safe_message_subtract(new_message, old_message)
+    if threading
+        Threads.@threads :greedy for i in eachindex(es)
+            e = es[i]
+            new_message, _ = updated_message(update_alg, bpc, e)
+            old_message = message(bpc, e)
+            greedy_msgs[i] = new_message
+            greedy_residues[i] = index_safe_message_subtract(new_message, old_message)
+        end
+    else
+        for i in eachindex(es)
+            e = es[i]
+            new_message, _ = updated_message(update_alg, bpc, e)
+            old_message = message(bpc, e)
+            greedy_msgs[i] = new_message
+            greedy_residues[i] = index_safe_message_subtract(new_message, old_message)
+        end
     end
     return greedy_msgs, greedy_residues
 end
@@ -230,11 +249,11 @@ end
 function anderson_least_squares(
         residues::Vector{Vector{M}},
         edges::AbstractVector{<:NamedEdge};
-        threaded = true
+        threading = true
     ) where M <: Union{ITensor, Vector{ITensor}}
     N = length(residues) # M + 1 = number of message proposals from the past + the current one
     C = zeros(N + 1, N + 1)
-    if !threaded
+    if !threading
         for i in 1:N
             for j in i:N
                 Cij = 0.0
@@ -246,7 +265,6 @@ function anderson_least_squares(
             end
         end
     else
-        
         Threads.@threads :greedy for i in 1:N
             for j in i:N
                 Cij = 0.0
@@ -273,6 +291,7 @@ function anderson_acceleration_update(
         memory_window::Int, # how many of the previous message updates should be used to construct the Anderson-accelerated update
         ;
         alphas = nothing,
+        threading = true,
 
     ) where {V, N <: AbstractTensorNetwork{V}, M <: Union{ITensor, Vector{ITensor}}}    
     
@@ -286,7 +305,7 @@ function anderson_acceleration_update(
     vec_edge_seq = vec_edge_sequence(bpch)
     n_edges = length(vec_edge_seq)
     # solve the least-squares problem to find optimal linear combination of the previous messages based on their respective residues
-    alpha = anderson_least_squares(prev_residuals, vec_edge_seq)
+    alpha = anderson_least_squares(prev_residuals, vec_edge_seq, threading = threading)
     if !isnothing(alphas)
         push!(alphas, copy(alpha))
     end
@@ -301,8 +320,8 @@ function anderson_acceleration_update(
     return AA_messages
 end
 
-function messages_are_PD(messages::Vector{M}; threaded = false) where M <: Union{ITensor, Vector{ITensor}}
-    if threaded
+function messages_are_PD(messages::Vector{M}; threading = false) where M <: Union{ITensor, Vector{ITensor}}
+    if threading
         Threads.@threads :greedy for i in eachindex(messages)
             m = messages[i]
             inds = collect(ITensors.inds(m))
@@ -338,16 +357,17 @@ function update_with_anderson_acceleration(
         residual_tol::Float64 = default_residual_tol(),
         residual_diff_tol::Float64 = default_residual_diff_tol(),
         msgdiff_tol::Float64 = default_msgdiff_tol(),
-        greedy_steps::Int = 0
+        greedy_steps::Int = 0,
+        threading = true
     )
     vec_edge_seq = collect(edge_sequence(bpc))
     # initialize anderson acceleration with one greedy update step
     update_alg = set_default_kwargs(Algorithm(default_message_update_alg(bpc)), bpc)
     x0 = [message(bpc, e) for e in vec_edge_seq] # x_0 = initial messages
-    u0, r0 = simultaneous_greedy_update(bpc, vec_edge_seq; update_alg = update_alg) # u_0 = one greedy update based on x_0, r_0 = greedy residuals u_0 - x_0
+    u0, r0 = simultaneous_greedy_update(bpc, vec_edge_seq; update_alg = update_alg, threading = threading) # u_0 = one greedy update based on x_0, r_0 = greedy residuals u_0 - x_0
     x1 = u0 # for initialization, the accepted step is the greedy step
     bpc = update_bpc_messages(bpc, x1, vec_edge_seq)
-    u1, r1 = simultaneous_greedy_update(bpc, vec_edge_seq; update_alg = update_alg)
+    u1, r1 = simultaneous_greedy_update(bpc, vec_edge_seq; update_alg = update_alg, threading = threading) 
     bpch = BeliefPropagationCacheHistory(bpc, x0, x1, u0, u1, r0, r1; history_capacity = memory_window)
     # start Anderson update loop
     greedy_steps_done = 0
@@ -355,16 +375,17 @@ function update_with_anderson_acceleration(
         if greedy_steps_done < greedy_steps
             greedy_steps_done += 1
             bpc = BeliefPropagationCache(bpch)
-            uk, rk = simultaneous_greedy_update(bpc, vec_edge_seq; update_alg = update_alg)
+            uk, rk = simultaneous_greedy_update(bpc, vec_edge_seq; update_alg = update_alg, threading = threading)
             new_messages = uk
         else
             new_messages = anderson_acceleration_update(
                 bpch,
                 memory_window;
                 alphas,
+                threading = threading,
             )
         end
-        res_norms, subtr_msg_diffs, dot_msg_diffs = update_history!(bpch, new_messages; return_msgdiff = true)
+        res_norms, subtr_msg_diffs, dot_msg_diffs = update_history!(bpch, new_messages; return_msgdiff = true, threading = threading)
         
         # ----- monitoring -----
         avg_residual_norm = mean(res_norms)
@@ -390,7 +411,7 @@ function update_with_anderson_acceleration(
             return bpch, true, i
         end
         check_PD_with_threading = false
-        if check_PD && !messages_are_PD(new_messages; threaded=check_PD_with_threading)
+        if check_PD && !messages_are_PD(new_messages; threading=check_PD_with_threading)
             @warn "Messages no longer PD after iteration $i."
             return bpch, false, i
         end
@@ -399,8 +420,11 @@ function update_with_anderson_acceleration(
     return bpch, false, maxiter
 end
 
-# update function similar to standard/greedy update but with residual priority queue and Anderson ac
-function residual_queue_sequential_update(
+# --------------------------------------------------------------------------------------------------------------------
+# Perform sweeps of sequential updates where edge sequence is determined by residual norm (largest first)
+# --------------------------------------------------------------------------------------------------------------------
+
+function update_via_sequential_sweeps_with_residue_edge_sequence(
         alg::Algorithm"bp",
         bpc::BeliefPropagationCache;
         verbose::Bool = false,
@@ -421,7 +445,7 @@ function residual_queue_sequential_update(
     update_alg = set_default_kwargs(Algorithm(default_message_update_alg(bpc)), bpc)
     for i in 1:maxiter
         # perform sequential update along edge sequence and update the edge sequence based on the norm of the residuals
-        edge_seq, res_norms, dot_msg_diff = update_iteration_residue_priority!(alg, bpc, edge_seq; update_alg = update_alg)
+        edge_seq, res_norms, dot_msg_diff = update_iteration_residue_edge_sequence!(bpc, edge_seq; update_alg = update_alg)
         subtr_msg_diffs = res_norms # since this is the greedy update the message difference is equal to the residual
 
         # ----- monitoring -----
@@ -454,12 +478,11 @@ function residual_queue_sequential_update(
     return bpc, false, maxiter
 end
 
-function residual_queue_sequential_update(bpc::AbstractBeliefPropagationCache; alg = default_update_alg(bpc), kwargs...)
-    return residual_queue_sequential_update(set_default_kwargs(Algorithm(alg), bpc), bpc; kwargs...)
+function update_via_sequential_sweeps_with_residue_edge_sequence(bpc::AbstractBeliefPropagationCache; alg = default_update_alg(bpc), kwargs...)
+    return update_via_sequential_sweeps_with_residue_edge_sequence(set_default_kwargs(Algorithm(alg), bpc), bpc; kwargs...)
 end
 
-function update_iteration_residue_priority!(
-        alg::Algorithm"bp",
+function update_iteration_residue_edge_sequence!(
         bpc::AbstractBeliefPropagationCache,
         edges::AbstractVector{<:NamedEdge};
         update_alg = set_default_kwargs(Algorithm(default_message_update_alg(bpc)), bpc)
@@ -476,4 +499,116 @@ function update_iteration_residue_priority!(
     end
     edge_perm = sortperm(res_norms, rev = true)
     return edges[edge_perm], res_norms[edge_perm], dot_msg_diff[edge_perm]
+end
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# Perform sequential updates to the edge with the largest residue until all residues are converged
+# --------------------------------------------------------------------------------------------------------------------
+
+
+# since we are updating individual edges now instead of sweeping through and updating each edge once
+# we record msgdiff and residue quantities every length(edges) message updates for comparison
+function update_max_residue_loop(
+        bpc::BeliefPropagationCache;
+        verbose::Bool = false,
+        maxiter = 100,
+        avg_residual_norms = nothing,
+        avg_dot_msg_diffs = nothing,
+        residual_tol::Float64 = default_residual_tol(),
+        residual_diff_tol::Float64 = default_residual_diff_tol(),
+        msgdiff_tol::Float64 = default_msgdiff_tol(),
+    )
+    bpc = copy(bpc)
+    invalidate_contraction_sequences!(bpc)
+    update_alg = set_default_kwargs(Algorithm(default_message_update_alg(bpc)), bpc)
+    converged = false
+
+    # initialize by computing residues on all edges
+    updated_msgs = Dictionary{NamedEdge, ITensor}()
+    residue_norms = Dictionary{NamedEdge, Float64}()
+    dot_msg_diffs = Dictionary{NamedEdge, Float64}()
+    edges = edge_sequence(bpc)
+    n_edges = length(edges)
+    for e in edges
+        prev_message = message(bpc, e)
+        new_message, _ = updated_message(update_alg, bpc, e)
+        set!(updated_msgs, e, new_message)
+        set!(residue_norms, e, norm(new_message - prev_message))
+        set!(dot_msg_diffs, e, sqrt(max(message_diff(new_message, prev_message), 0.0)))
+    end
+    # start actual update loop
+    for i in 1:maxiter 
+        # perform n_edges-many updates of individual edges which have the largest residuals at the time of updating
+        updated_msgs, residue_norms, dot_msg_diffs = update_iteration_max_residue_sweep!(
+            bpc,
+            n_edges,
+            updated_msgs,
+            residue_norms,
+            dot_msg_diffs,;
+            update_alg = update_alg,
+        )
+        # ----- monitoring -----
+        avg_residual_norm = mean(values(residue_norms))
+        avg_dot_msg_diff = mean(values(dot_msg_diffs))
+        if !isnothing(avg_residual_norms)
+            push!(avg_residual_norms, avg_residual_norm)
+        end
+        if !isnothing(avg_dot_msg_diffs)
+            push!(avg_dot_msg_diffs, avg_dot_msg_diff)
+        end
+        if avg_residual_norm  <= residual_tol
+            if verbose
+                println("Converged after $i iterations (residuals approximately zero).")
+            end
+            invalidate_contraction_sequences!(bpc)
+            return bpc, true, i
+        end
+    end
+    @warn "Residual queue sequential update did not converge after $maxiter iterations."
+    invalidate_contraction_sequences!(bpc)
+    return bpc, false, maxiter
+end
+
+function update_iteration_max_residue_sweep!(
+        bpc::BeliefPropagationCache,
+        n_updates::Int,
+        updated_msgs::Dictionary{NamedEdge, ITensor},
+        residue_norms::Dictionary{NamedEdge, Float64},
+        dot_msg_diffs::Dictionary{NamedEdge, Float64};
+        update_alg = set_default_kwargs(Algorithm(default_message_update_alg(bpc)), bpc),
+    )
+
+    for i in 1:n_updates
+        # update edge with largest residue
+        max_edge = findmax(residue_norms)[2]
+        new_message = updated_msgs[max_edge]
+        setmessage!(bpc, max_edge, new_message)
+        # compute new messages and residues for edges affected by the update of max_edge
+        v = dst(max_edge)
+        edges_to_update = outgoing_edges(bpc, v; ignore_edges = [reverse(max_edge)])
+        for e in edges_to_update
+            prev_message = message(bpc, e)
+            new_message, _ = updated_message(update_alg, bpc, e)
+            set!(updated_msgs, e, new_message)
+            set!(residue_norms, e, norm(new_message - prev_message))
+            set!(dot_msg_diffs, e, sqrt(max(message_diff(new_message, prev_message), 0.0)))
+        end
+        residue_norms[max_edge] = 0.0
+        dot_msg_diffs[max_edge] = 0.0
+    end
+
+    return updated_msgs, residue_norms, dot_msg_diffs
+end
+
+function outgoing_edges(
+        bp_cache::AbstractBeliefPropagationCache, vertices::Vector{<:Any}; ignore_edges = []
+    )
+    b_edges = NamedGraphs.GraphsExtensions.boundary_edges(bp_cache, vertices; dir = :out)
+    b_edges = !isempty(ignore_edges) ? setdiff(b_edges, ignore_edges) : b_edges
+    return b_edges
+end
+
+function outgoing_edges(bp_cache::AbstractBeliefPropagationCache, vertex; kwargs...)
+    return outgoing_edges(bp_cache, [vertex]; kwargs...)
 end

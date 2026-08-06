@@ -210,21 +210,18 @@ function update_iteration!(
         alg::Algorithm"bp",
         bpc::AbstractBeliefPropagationCache,
         edges::Vector;
-        (update_diff!) = nothing,
-        (herm_error!) = nothing,
-        (cond_num!) = nothing,
+        (total_msg_dot_diff!) = nothing,
+        (total_residue_norm!) = nothing,
     )
     for e in edges
-        prev_message = !isnothing(update_diff!) ? message(bpc, e) : nothing
+
+        prev_message = !isnothing(total_msg_dot_diff!) || !isnothing(total_residue_norm!) ? message(bpc, e) : nothing
         update_message!(alg.kwargs.message_update_alg, bpc, e)
-        if !isnothing(update_diff!)
-            update_diff![] += message_diff(message(bpc, e), prev_message)
+        if !isnothing(total_msg_dot_diff!)
+            total_msg_dot_diff![] += message_diff(message(bpc, e), prev_message)
         end
-        if !isnothing(herm_error!)
-            herm_error![] += hermiticity_error(message(bpc, e))
-        end
-        if !isnothing(cond_num!)
-            cond_num![] += condition_number(message(bpc, e))
+        if !isnothing(total_residue_norm!)
+            total_residue_norm![] += norm(message(bpc, e) - prev_message)
         end
     end
     return bpc
@@ -234,44 +231,45 @@ end
 More generic interface for update, with default params
 """
 function update(alg::Algorithm"bp", bpc::AbstractBeliefPropagationCache)
-    compute_error = !isnothing(alg.kwargs.tolerance)
+    residue_tol = get(alg.kwargs, :tolerance, nothing)
+    compute_residue = !isnothing(residue_tol) || !isnothing(alg.kwargs.residues)
+    compute_msgdiff = !isnothing(alg.kwargs.msgdiffs)
     if isnothing(alg.kwargs.maxiter)
         error("You need to specify a number of iterations for BP!")
     end
     bpc = copy(bpc)
     invalidate_contraction_sequences!(bpc)
     converged = false
-    avg_diff = nothing
+    avg_residue_norm = nothing
     niter = alg.kwargs.maxiter
     n_messages = length(edge_sequence(bpc))
     for i in 1:alg.kwargs.maxiter
-        diff = compute_error ? Ref(0.0) : nothing
-        herm = compute_error ? Ref(0.0) : nothing
-        cond = compute_error ? Ref(0.0) : nothing
-        update_iteration!(alg, bpc, alg.kwargs.edge_sequence; (update_diff!) = diff, (herm_error!) = herm, (cond_num!) = cond)
-        if compute_error
-            avg_diff = diff.x / length(alg.kwargs.edge_sequence)
-            if !isnothing(alg.kwargs.msgdiffs)
-                push!(alg.kwargs.msgdiffs, avg_diff)
+        total_dot_msg_diff = compute_msgdiff ? Ref(0.0) : nothing
+        total_residue_norm = compute_residue ? Ref(0.0) : nothing
+        update_iteration!(alg, bpc, alg.kwargs.edge_sequence;
+                (total_msg_dot_diff!) = total_dot_msg_diff,
+                (total_residue_norm!) = total_residue_norm,
+            )
+        if compute_residue
+            avg_residue_norm = total_residue_norm.x/n_messages
+            if !isnothing(alg.kwargs.residues)
+                push!(alg.kwargs.residues, avg_residue_norm) # Average residue norm per message
             end
-            if !isnothing(alg.kwargs.herm_error)
-                push!(alg.kwargs.herm_error, herm.x/n_messages) # Average hermiticity error per message
-            end
-            if !isnothing(alg.kwargs.cond_num)
-                push!(alg.kwargs.cond_num, cond.x/n_messages) # Average condition number per message
-            end
-            if avg_diff <= alg.kwargs.tolerance
+            if !isnothing(residue_tol) && avg_residue_norm <= residue_tol
                 converged = true
                 niter = i
                 break
             end
         end
+        if compute_msgdiff
+            push!(alg.kwargs.msgdiffs, sqrt(max(total_dot_msg_diff.x/n_messages, 0.0)))
+        end
     end
-    if compute_error
+    if !isnothing(residue_tol)
         if converged
-            alg.kwargs.verbose && println("BP converged to desired precision after $niter iterations.")
+            alg.kwargs.verbose && println("BP residue converged to desired precision after $niter iterations.")
         else
-            msg = "BP did not converge to tolerance $(alg.kwargs.tolerance) after $niter iterations (final average message change: $avg_diff)."
+            msg = "BP did not converge to average residue tolerance $(alg.kwargs.tolerance) after $niter iterations (final average residue norm: $avg_residue_norm)."
             alg.kwargs.verbose ? println(msg) : @warn(msg)
         end
     end

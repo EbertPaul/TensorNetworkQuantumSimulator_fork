@@ -132,8 +132,11 @@ export
     update_with_anderson_acceleration,
     update_history,
     vec_edge_sequence,
-    # the edge priority stuff
-    residual_queue_sequential_update,
+    default_residual_tol,
+    # the edge sequence = descending residues stuff
+    update_via_sequential_sweeps_with_residue_edge_sequence,
+    # the update max residue edge stuff
+    update_max_residue_loop,
     # the gradient stuff
     BPTraceGradientResult,
     bp_trace_residual_loss_and_gradient,
