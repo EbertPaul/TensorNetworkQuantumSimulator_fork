@@ -1,6 +1,7 @@
 using Base.Threads
 using ITensors: Algorithm
 using Dictionaries: Dictionary, set!
+using Random: MersenneTwister, rand
 
 function default_residual_tol() :: Float64 return 1e-7 end
 function default_residual_diff_tol() :: Float64 return 1e-10 end
@@ -518,6 +519,9 @@ function update_max_residue_loop(
         residual_tol::Float64 = default_residual_tol(),
         residual_diff_tol::Float64 = default_residual_diff_tol(),
         msgdiff_tol::Float64 = default_msgdiff_tol(),
+        randomize::Bool = false,
+        random_window::Int = 3,
+        random_seed::Int = 1234,
     )
     bpc = copy(bpc)
     invalidate_contraction_sequences!(bpc)
@@ -547,6 +551,9 @@ function update_max_residue_loop(
             residue_norms,
             dot_msg_diffs,;
             update_alg = update_alg,
+            randomize = randomize,
+            random_window = random_window,
+            random_seed = random_seed
         )
         # ----- monitoring -----
         avg_residual_norm = mean(values(residue_norms))
@@ -577,16 +584,31 @@ function update_iteration_max_residue_sweep!(
         residue_norms::Dictionary{NamedEdge, Float64},
         dot_msg_diffs::Dictionary{NamedEdge, Float64};
         update_alg = set_default_kwargs(Algorithm(default_message_update_alg(bpc)), bpc),
+        randomize::Bool = false,
+        random_window::Int = 3,
+        random_seed::Int = 1234
     )
-
+    rng = randomize ? MersenneTwister(random_seed) : nothing
     for i in 1:n_updates
-        # update edge with largest residue
-        max_edge = findmax(residue_norms)[2]
-        new_message = updated_msgs[max_edge]
-        setmessage!(bpc, max_edge, new_message)
-        # compute new messages and residues for edges affected by the update of max_edge
-        v = dst(max_edge)
-        edges_to_update = outgoing_edges(bpc, v; ignore_edges = [reverse(max_edge)])
+        if !randomize
+            # update edge with largest residue
+            update_edge = findmax(residue_norms)[2]
+        else
+            # update random edge among the random_window edges with the largest residues
+            if random_window <= 0
+                error("random_window must be a positive integer.")
+            end
+            sorted_edges = collect(keys(residue_norms))
+            sort!(sorted_edges; by = e -> residue_norms[e], rev = true)
+            n_top = min(random_window, length(sorted_edges))
+            update_edge = rand(rng, sorted_edges[1:n_top])
+        end
+        # update the update_edge
+        new_message = updated_msgs[update_edge]
+        setmessage!(bpc, update_edge, new_message)
+        # compute new messages and residues for edges affected by the update of update_edge
+        v = dst(update_edge)
+        edges_to_update = outgoing_edges(bpc, v; ignore_edges = [reverse(update_edge)])
         for e in edges_to_update
             prev_message = message(bpc, e)
             new_message, _ = updated_message(update_alg, bpc, e)
@@ -594,8 +616,8 @@ function update_iteration_max_residue_sweep!(
             set!(residue_norms, e, norm(new_message - prev_message))
             set!(dot_msg_diffs, e, sqrt(max(message_diff(new_message, prev_message), 0.0)))
         end
-        residue_norms[max_edge] = 0.0
-        dot_msg_diffs[max_edge] = 0.0
+        residue_norms[update_edge] = 0.0
+        dot_msg_diffs[update_edge] = 0.0
     end
 
     return updated_msgs, residue_norms, dot_msg_diffs
